@@ -1,0 +1,214 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: S3 Lifecycle Policy Check
+Resources:
+  S3LifecyclePolicyCheck:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: s3-lifecycle-policy-check
+      Description: Checks if a lifecycle rule is configured for an Amazon Simple Storage Service (Amazon S3) bucket. The rule is NON_COMPLIANT if there is no active lifecycle configuration rules or the configuration does not match with the parameter values.
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::S3::Bucket
+      Source:
+        Owner: AWS
+        SourceIdentifier: S3_LIFECYCLE_POLICY_CHECK
+  ConfigureS3BucketLifecycleRule:
+    Type: AWS::SSM::Document
+    Properties:
+      Content:
+        description: |
+          ### Document Name - ConfigureS3BucketLifecycleRule
+
+          ## What does this document do?
+          This document is used to create or modify the lifecycle rule configuration for an Amazon S3 bucket.
+
+          ## Input Parameters
+          * BucketName: (Required) Name of the S3 bucket (not the ARN).
+          * TransitionDays: (Optional) Number of days after creation when objects are transitioned to the specified storage class.
+            * Default: 90
+          * TransitionStorageClass: (Optional) Storage class to which the object is transitioned.
+            * Default: "INTELLIGENT_TIERING"
+          * NoncurrentTransitionDays: (Optional) Number of days after becoming noncurrent when objects are transitioned to the specified storage class.
+            * Default: 30
+          * NoncurrentTransitionStorageClass: (Optional) Storage class to which the noncurrent object is transitioned.
+            * Default: "INTELLIGENT_TIERING"
+          * AutomationAssumeRole: (Required) ARN of the role that allows Automation to perform the actions.
+
+          ## Output Parameters
+          * GetBucketLifecycleConfiguration.Output - JSON formatted response from the GetBucketLifecycleConfiguration API call
+        schemaVersion: "0.3"
+        assumeRole: "{{ AutomationAssumeRole }}"
+        outputs:
+          - GetBucketLifecycleConfiguration.Output
+        parameters:
+          BucketName:
+            type: String
+            description: (Required) Name of the S3 bucket (not the ARN).
+            allowedPattern: (?=^.{3,63}$)(?!^(\d+\.)+\d+$)(^(([a-z0-9]|[a-z0-9][a-z0-9\-]*[a-z0-9])\.)*([a-z0-9]|[a-z0-9][a-z0-9\-]*[a-z0-9])$)
+          TransitionDays:
+            type: Integer
+            description: (Optional) Number of days after creation when objects are transitioned to the specified storage class.
+            default: 90
+          TransitionStorageClass:
+            type: String
+            description: (Optional) Storage class to which the object is transitioned.
+            default: INTELLIGENT_TIERING
+            allowedValues:
+              - STANDARD_IA
+              - INTELLIGENT_TIERING
+              - ONEZONE_IA
+              - GLACIER
+              - GLACIER_IR
+              - DEEP_ARCHIVE
+          NoncurrentTransitionDays:
+            type: Integer
+            description: (Optional) Number of days after becoming noncurrent when objects are transitioned to the specified storage class.
+            default: 30
+          NoncurrentTransitionStorageClass:
+            type: String
+            description: (Optional) Storage class to which the noncurrent object is transitioned.
+            default: INTELLIGENT_TIERING
+            allowedValues:
+              - STANDARD_IA
+              - INTELLIGENT_TIERING
+              - ONEZONE_IA
+              - GLACIER
+              - GLACIER_IR
+              - DEEP_ARCHIVE
+          AutomationAssumeRole:
+            type: String
+            description: (Required) ARN of the role that allows Automation to perform the actions.
+            allowedPattern: ^arn:(aws[a-zA-Z-]*)?:iam::\d{12}:role/[\w+=,.@-]+
+        mainSteps:
+          - name: PutBucketLifecycleConfiguration
+            action: "aws:executeAwsApi"
+            description: |
+              ## PutBucketLifecycleConfiguration
+              Creates or modifies the lifecycle configuration for a S3 Bucket.
+            isEnd: false
+            inputs:
+              Service: s3
+              Api: PutBucketLifecycleConfiguration
+              Bucket: "{{BucketName}}"
+              LifecycleConfiguration:
+                Rules:
+                  - Filter:
+                      Prefix: ""
+                    ID: "Default Lifecycle Rule"
+                    Status: Enabled
+                    Transitions:
+                      - Days: "{{ TransitionDays }}"
+                        StorageClass: "{{ TransitionStorageClass }}"
+                    NoncurrentVersionTransitions:
+                      - NoncurrentDays: "{{ NoncurrentTransitionDays }}"
+                        StorageClass: "{{ NoncurrentTransitionStorageClass }}"
+            isCritical: true
+            maxAttempts: 2
+            timeoutSeconds: 600
+          - name: GetBucketLifecycleConfiguration
+            action: "aws:executeScript"
+            description: |
+              ## GetBucketLifecycleConfiguration
+              Retrieves the S3 lifecycle configuration for a S3 Bucket.
+              ## Outputs
+              * Output: JSON formatted response from the GetBucketLifecycleConfiguration API call.
+            timeoutSeconds: 600
+            isCritical: true
+            isEnd: true
+            inputs:
+              Runtime: python3.6
+              Handler: validate_s3_bucket_lifecycle_configuration
+              InputPayload:
+                Bucket: "{{BucketName}}"
+                TransitionDays: "{{ TransitionDays }}"
+                TransitionStorageClass: "{{ TransitionStorageClass }}"
+                NoncurrentTransitionDays: "{{ NoncurrentTransitionDays }}"
+                NoncurrentTransitionStorageClass: "{{ NoncurrentTransitionStorageClass }}"
+              Script: |-
+                import boto3
+
+                def validate_s3_bucket_lifecycle_configuration(event, context):
+                    s3_client = boto3.client("s3")
+                    bucket = event["Bucket"]
+                    transition_days = event["TransitionDays"]
+                    transition_storage_class = event["TransitionStorageClass"]
+                    noncurrent_transition_days = event["NoncurrentTransitionDays"]
+                    noncurrent_transition_storage_class = event["NoncurrentTransitionStorageClass"]
+
+                    output = s3_client.get_bucket_lifecycle_configuration(Bucket=bucket)
+                    updated_rules = output["Rules"]
+
+                    if any(
+                        any(updated_transition["Days"] == transition_days
+                            and updated_transition["StorageClass"] == transition_storage_class
+                            for updated_transition in updated_rule["Transitions"])
+                        and any(updated_noncurrent_transition["NoncurrentDays"] == noncurrent_transition_days
+                                and updated_noncurrent_transition["StorageClass"] == noncurrent_transition_storage_class
+                                for updated_noncurrent_transition in updated_rule["NoncurrentVersionTransitions"])
+                        and updated_rule["Status"] == "Enabled"
+                        for updated_rule in updated_rules
+                    ):
+                        return {
+                            "output":
+                            {
+                                "message": "Bucket lifecycle configuration successfully set.",
+                                "configuration": updated_rules
+                            }
+                        }
+                    else:
+                        info = "CONFIGURATION VALUES DO NOT MATCH WITH PARAMETERS PROVIDED VALUES TransitionDays: {}, TransitionStorageClass: {}, NoncurrentTransitionDays: {}, NoncurrentTransitionStorageClass: {}".format(
+                            transition_days,
+                            transition_storage_class,
+                            noncurrent_transition_days,
+                            noncurrent_transition_storage_class
+                        )
+                        raise Exception(info)
+            outputs:
+              - Name: Output
+                Selector: $.Payload.output
+                Type: StringMap
+      DocumentFormat: YAML
+      DocumentType: Automation
+      Name: ConfigureS3BucketLifecycleRule
+  S3ConfigureBucketLifecycleRuleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonSSMAutomationRole
+      Policies:
+        - PolicyName: s3-configure-bucket-lifecycle-rule
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutLifecycleConfiguration
+                  - s3:GetLifecycleConfiguration
+                Resource: "*"
+      RoleName: s3-configure-bucket-lifecycle-rule
+  S3LifecyclePolicyCheckRemediation:
+    DependsOn: S3LifecyclePolicyCheck
+    Type: AWS::Config::RemediationConfiguration
+    Properties:
+      Automatic: True
+      ConfigRuleName: s3-lifecycle-policy-check
+      MaximumAutomaticAttempts: 10
+      Parameters:
+        AutomationAssumeRole:
+          StaticValue:
+            Values:
+              - !Sub arn:aws:iam::${AWS::AccountId}:role/s3-configure-bucket-lifecycle-rule
+        BucketName:
+          ResourceValue:
+            Value: RESOURCE_ID
+      RetryAttemptSeconds: 600
+      TargetId: !Ref ConfigureS3BucketLifecycleRule
+      TargetType: SSM_DOCUMENT
